@@ -1,0 +1,903 @@
+/* Edge Impulse ingestion SDK
+ * Copyright (c) 2022 EdgeImpulse Inc.
+ *
+ * Licensed under the Apache License, Version 2.0
+ */
+
+#define EIDSP_QUANTIZE_FILTERBANK   0
+#define EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW 4
+
+/* Includes ---------------------------------------------------------------- */
+#include <PDM.h>
+#include <WiFiEspAT.h>
+#include <mangazatria-project-1_inferencing.h>
+
+/* ============================================================
+   WIFI CONFIGURATION
+   ============================================================ */
+
+const char WIFI_SSID[] = "UPH@Event";
+const char WIFI_PASS[] = "***";
+
+/* Server */
+const char SERVER_HOST[] = "https://checkinmedan.my.id/";
+const int SERVER_PORT = 80;
+
+/* API endpoint */
+const char SERVER_PATH[] = "aerosense/sneeze.php";
+
+/* Device ID */
+const char DEVICE_ID[] = "1";
+
+/* ============================================================
+   RELAY CONFIGURATION
+   ============================================================ */
+
+const int relayPin = 2;
+
+/*
+ * Air purifier menyala selama 15 menit
+ * 900000 ms = 15 menit
+ */
+const unsigned long PURIFIER_DURATION = 900000UL;
+
+bool purifierOn = false;
+unsigned long purifierStartTime = 0;
+
+/* ============================================================
+   AUDIO BUFFER
+   ============================================================ */
+
+typedef struct {
+    signed short *buffers[2];
+    unsigned char buf_select;
+    unsigned char buf_ready;
+    unsigned int buf_count;
+    unsigned int n_samples;
+} inference_t;
+
+static inference_t inference;
+
+static bool record_ready = false;
+static signed short *sampleBuffer;
+static bool debug_nn = false;
+
+static int print_results =
+    -(EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW);
+
+/* ============================================================
+   FUNCTION DECLARATIONS
+   ============================================================ */
+
+static void pdm_data_ready_inference_callback(void);
+
+static bool microphone_inference_start(uint32_t n_samples);
+
+static bool microphone_inference_record(void);
+
+static int microphone_audio_signal_get_data(
+    size_t offset,
+    size_t length,
+    float *out_ptr
+);
+
+static void microphone_inference_end(void);
+
+void connectWiFi();
+
+void startPurifier(float confidence);
+
+void updatePurifier();
+
+void sendSneezeData(float confidence);
+
+
+/* ============================================================
+   SETUP
+   ============================================================ */
+
+void setup()
+{
+    Serial.begin(115200);
+
+    /*
+     * Wait for USB serial
+     */
+    while (!Serial);
+
+    Serial.println();
+    Serial.println("=================================");
+    Serial.println("AeroSense - Sneeze Detection");
+    Serial.println("=================================");
+
+    /* Relay */
+    pinMode(relayPin, OUTPUT);
+    digitalWrite(relayPin, LOW);
+
+    /* ========================================================
+       WIFI
+       ======================================================== */
+
+    Serial.println("Initializing ESP-01E...");
+
+    Serial1.begin(115200);
+
+    WiFi.init(Serial1);
+
+    connectWiFi();
+
+
+    /* ========================================================
+       EDGE IMPULSE
+       ======================================================== */
+
+    Serial.println();
+    Serial.println("Edge Impulse Inferencing Demo");
+
+    ei_printf("Inferencing settings:\n");
+
+    ei_printf("\tInterval: %.2f ms.\n",
+              (float)EI_CLASSIFIER_INTERVAL_MS);
+
+    ei_printf("\tFrame size: %d\n",
+              EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
+
+    ei_printf("\tSample length: %d ms.\n",
+              EI_CLASSIFIER_RAW_SAMPLE_COUNT / 16);
+
+    ei_printf("\tNo. of classes: %d\n",
+              sizeof(ei_classifier_inferencing_categories) /
+              sizeof(ei_classifier_inferencing_categories[0]));
+
+
+    run_classifier_init();
+
+
+    if (microphone_inference_start(
+            EI_CLASSIFIER_SLICE_SIZE) == false)
+    {
+        ei_printf(
+            "ERR: Could not allocate audio buffer "
+            "(size %d)\r\n",
+            EI_CLASSIFIER_RAW_SAMPLE_COUNT
+        );
+
+        return;
+    }
+
+    Serial.println("System ready.");
+}
+
+
+/* ============================================================
+   LOOP
+   ============================================================ */
+
+void loop()
+{
+    /*
+     * Update status air purifier
+     */
+    updatePurifier();
+
+
+    /*
+     * Record microphone
+     */
+    bool m = microphone_inference_record();
+
+    if (!m)
+    {
+        ei_printf(
+            "ERR: Failed to record audio...\n"
+        );
+
+        return;
+    }
+
+
+    /*
+     * Edge Impulse signal
+     */
+    signal_t signal;
+
+    signal.total_length =
+        EI_CLASSIFIER_SLICE_SIZE;
+
+    signal.get_data =
+        &microphone_audio_signal_get_data;
+
+
+    ei_impulse_result_t result = {0};
+
+
+    /*
+     * Run classifier
+     */
+    EI_IMPULSE_ERROR r =
+        run_classifier_continuous(
+            &signal,
+            &result,
+            debug_nn
+        );
+
+
+    if (r != EI_IMPULSE_OK)
+    {
+        ei_printf(
+            "ERR: Failed to run classifier (%d)\n",
+            r
+        );
+
+        return;
+    }
+
+
+    /*
+     * Print prediction
+     */
+    if (++print_results >=
+        EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW)
+    {
+        ei_printf("Predictions ");
+
+        ei_printf(
+            "(DSP: %d ms., Classification: %d ms., "
+            "Anomaly: %d ms.)",
+            result.timing.dsp,
+            result.timing.classification,
+            result.timing.anomaly
+        );
+
+        ei_printf(": \n");
+
+
+        for (size_t ix = 0;
+             ix < EI_CLASSIFIER_LABEL_COUNT;
+             ix++)
+        {
+            ei_printf(
+                "    %s: %.5f\n",
+                result.classification[ix].label,
+                result.classification[ix].value
+            );
+
+
+            /*
+             * SNEEZE DETECTION
+             */
+            if (
+                strcmp(
+                    result.classification[ix].label,
+                    "sneeze"
+                ) == 0
+            )
+            {
+                float confidence =
+                    result.classification[ix].value;
+
+
+                if (confidence > 0.80)
+                {
+                    /*
+                     * Jangan trigger ulang kalau
+                     * purifier masih menyala.
+                     */
+                    if (!purifierOn)
+                    {
+                        startPurifier(confidence);
+                    }
+                    else
+                    {
+                        ei_printf(
+                            "Bersin terdeteksi, "
+                            "tetapi purifier masih menyala.\n"
+                        );
+                    }
+                }
+            }
+        }
+
+
+#if EI_CLASSIFIER_HAS_ANOMALY == 1
+
+        ei_printf(
+            "    anomaly score: %.3f\n",
+            result.anomaly
+        );
+
+#endif
+
+
+        print_results = 0;
+    }
+}
+
+
+/* ============================================================
+   WIFI CONNECTION
+   ============================================================ */
+
+void connectWiFi()
+{
+    Serial.print("Connecting to WiFi: ");
+    Serial.println(WIFI_SSID);
+
+
+    int status = WiFi.begin(
+        WIFI_SSID,
+        WIFI_PASS
+    );
+
+
+    int retry = 0;
+
+    while (
+        status != WL_CONNECTED &&
+        retry < 20
+    )
+    {
+        delay(500);
+
+        Serial.print(".");
+
+        status = WiFi.status();
+
+        retry++;
+    }
+
+
+    Serial.println();
+
+
+    if (status == WL_CONNECTED)
+    {
+        Serial.println("WiFi connected!");
+
+        Serial.print("IP Address: ");
+
+        Serial.println(
+            WiFi.localIP()
+        );
+    }
+    else
+    {
+        Serial.println(
+            "WiFi connection failed."
+        );
+
+        Serial.println(
+            "System continues without WiFi."
+        );
+    }
+}
+
+
+/* ============================================================
+   START PURIFIER
+   ============================================================ */
+
+void startPurifier(float confidence)
+{
+    Serial.println();
+    Serial.println(
+        "================================="
+    );
+
+    Serial.println(
+        "BERSIN TERDETEKSI!"
+    );
+
+    Serial.print(
+        "Confidence: "
+    );
+
+    Serial.println(
+        confidence,
+        5
+    );
+
+    Serial.println(
+        "Menyalakan Air Purifier..."
+    );
+
+
+    /*
+     * Turn ON relay
+     */
+    digitalWrite(
+        relayPin,
+        HIGH
+    );
+
+
+    /*
+     * Save start time
+     */
+    purifierStartTime =
+        millis();
+
+    purifierOn = true;
+
+
+    /*
+     * Send event to server
+     */
+    sendSneezeData(
+        confidence
+    );
+
+
+    Serial.println(
+        "Air Purifier ON."
+    );
+
+    Serial.println(
+        "================================="
+    );
+}
+
+
+/* ============================================================
+   UPDATE PURIFIER
+   ============================================================ */
+
+void updatePurifier()
+{
+    if (!purifierOn)
+        return;
+
+
+    /*
+     * 15 minute timer
+     */
+    if (
+        millis() -
+        purifierStartTime
+        >=
+        PURIFIER_DURATION
+    )
+    {
+        /*
+         * Turn OFF relay
+         */
+        digitalWrite(
+            relayPin,
+            LOW
+        );
+
+
+        purifierOn = false;
+
+
+        Serial.println();
+        Serial.println(
+            "Air Purifier Dimatikan."
+        );
+    }
+}
+
+
+/* ============================================================
+   SEND SNEEZE DATA TO SERVER
+   ============================================================ */
+
+void sendSneezeData(float confidence)
+{
+    /*
+     * Check WiFi
+     */
+    if (
+        WiFi.status() != WL_CONNECTED
+    )
+    {
+        Serial.println(
+            "WiFi tidak terhubung."
+        );
+
+        return;
+    }
+
+
+    Serial.println(
+        "Mengirim data sneeze ke server..."
+    );
+
+
+    WiFiClient client;
+
+
+    /*
+     * Connect to server
+     */
+    if (
+        !client.connect(
+            SERVER_HOST,
+            SERVER_PORT
+        )
+    )
+    {
+        Serial.println(
+            "Gagal terhubung ke server."
+        );
+
+        return;
+    }
+
+
+    /*
+     * Prepare POST body
+     *
+     * Example:
+     *
+     * device_id=1
+     * confidence=0.93452
+     */
+    char postData[100];
+
+
+    snprintf(
+        postData,
+        sizeof(postData),
+        "device_id=%s&confidence=%.5f",
+        DEVICE_ID,
+        confidence
+    );
+
+
+    /*
+     * HTTP POST
+     */
+    client.print(
+        "POST "
+    );
+
+    client.print(
+        SERVER_PATH
+    );
+
+    client.println(
+        " HTTP/1.1"
+    );
+
+
+    client.print(
+        "Host: "
+    );
+
+    client.println(
+        SERVER_HOST
+    );
+
+
+    client.println(
+        "Content-Type: "
+        "application/x-www-form-urlencoded"
+    );
+
+
+    client.print(
+        "Content-Length: "
+    );
+
+    client.println(
+        strlen(postData)
+    );
+
+
+    client.println(
+        "Connection: close"
+    );
+
+    client.println();
+
+
+    /*
+     * Send POST body
+     */
+    client.println(
+        postData
+    );
+
+
+    /*
+     * Wait for response
+     */
+    unsigned long timeout =
+        millis();
+
+
+    while (
+        client.connected() &&
+        millis() - timeout < 3000
+    )
+    {
+        while (client.available())
+        {
+            char c =
+                client.read();
+
+            Serial.write(c);
+
+            timeout = millis();
+        }
+    }
+
+
+    client.stop();
+
+
+    Serial.println();
+    Serial.println(
+        "Data selesai dikirim."
+    );
+}
+
+
+/* ============================================================
+   PDM CALLBACK
+   ============================================================ */
+
+static void pdm_data_ready_inference_callback(void)
+{
+    int bytesAvailable =
+        PDM.available();
+
+
+    /*
+     * read into sample buffer
+     */
+    int bytesRead =
+        PDM.read(
+            (char *)&sampleBuffer[0],
+            bytesAvailable
+        );
+
+
+    if (record_ready == true)
+    {
+        for (
+            int i = 0;
+            i < (bytesRead >> 1);
+            i++
+        )
+        {
+            inference.buffers[
+                inference.buf_select
+            ][
+                inference.buf_count++
+            ] =
+                sampleBuffer[i];
+
+
+            if (
+                inference.buf_count >=
+                inference.n_samples
+            )
+            {
+                inference.buf_select ^= 1;
+
+                inference.buf_count = 0;
+
+                inference.buf_ready = 1;
+            }
+        }
+    }
+}
+
+
+/* ============================================================
+   START MICROPHONE
+   ============================================================ */
+
+static bool microphone_inference_start(
+    uint32_t n_samples
+)
+{
+    inference.buffers[0] =
+        (signed short *)malloc(
+            n_samples *
+            sizeof(signed short)
+        );
+
+
+    if (
+        inference.buffers[0] == NULL
+    )
+    {
+        return false;
+    }
+
+
+    inference.buffers[1] =
+        (signed short *)malloc(
+            n_samples *
+            sizeof(signed short)
+        );
+
+
+    if (
+        inference.buffers[1] == NULL
+    )
+    {
+        free(
+            inference.buffers[0]
+        );
+
+        return false;
+    }
+
+
+    sampleBuffer =
+        (signed short *)malloc(
+            (n_samples >> 1) *
+            sizeof(signed short)
+        );
+
+
+    if (
+        sampleBuffer == NULL
+    )
+    {
+        free(
+            inference.buffers[0]
+        );
+
+        free(
+            inference.buffers[1]
+        );
+
+        return false;
+    }
+
+
+    inference.buf_select = 0;
+
+    inference.buf_count = 0;
+
+    inference.n_samples = n_samples;
+
+    inference.buf_ready = 0;
+
+
+    /*
+     * Configure callback
+     */
+    PDM.onReceive(
+        &pdm_data_ready_inference_callback
+    );
+
+
+    PDM.setBufferSize(
+        (n_samples >> 1) *
+        sizeof(int16_t)
+    );
+
+
+    /*
+     * Start PDM
+     */
+    if (
+        !PDM.begin(
+            1,
+            EI_CLASSIFIER_FREQUENCY
+        )
+    )
+    {
+        ei_printf(
+            "Failed to start PDM!"
+        );
+
+        return false;
+    }
+
+
+    /*
+     * Microphone gain
+     */
+    PDM.setGain(127);
+
+
+    record_ready = true;
+
+
+    return true;
+}
+
+
+/* ============================================================
+   RECORD
+   ============================================================ */
+
+static bool microphone_inference_record(
+    void
+)
+{
+    bool ret = true;
+
+
+    if (
+        inference.buf_ready == 1
+    )
+    {
+        ei_printf(
+            "Error sample buffer overrun. "
+            "Decrease the number of slices "
+            "per model window "
+            "(EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW)\n"
+        );
+
+        ret = false;
+    }
+
+
+    while (
+        inference.buf_ready == 0
+    )
+    {
+        delay(1);
+    }
+
+
+    inference.buf_ready = 0;
+
+
+    return ret;
+}
+
+
+/* ============================================================
+   SIGNAL DATA
+   ============================================================ */
+
+static int microphone_audio_signal_get_data(
+    size_t offset,
+    size_t length,
+    float *out_ptr
+)
+{
+    numpy::int16_to_float(
+        &inference.buffers[
+            inference.buf_select ^ 1
+        ][offset],
+        out_ptr,
+        length
+    );
+
+
+    return 0;
+}
+
+
+/* ============================================================
+   END INFERENCE
+   ============================================================ */
+
+static void microphone_inference_end(void)
+{
+    PDM.end();
+
+    free(
+        inference.buffers[0]
+    );
+
+    free(
+        inference.buffers[1]
+    );
+
+    free(
+        sampleBuffer
+    );
+}
+
+
+/* ============================================================
+   CHECK MODEL
+   ============================================================ */
+
+#if !defined(EI_CLASSIFIER_SENSOR) || \
+    EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_MICROPHONE
+
+#error "Invalid model for current sensor."
+
+#endif
